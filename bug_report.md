@@ -338,3 +338,70 @@
           if len(bucket) > _MAX_REQUESTS:
               raise AppError(429, "RATE_LIMITED", "Too many booking requests")
   ```
+
+---
+
+## Bug 20 — Usage Report Cache Not Invalidated on Booking Creation
+- **File:** `app/routers/bookings.py`, line 124
+- **What the bug was:** When a member creates a new booking, the code invalidated the availability cache but forgot to invalidate the admin usage report cache for their organization. 
+- **Why it caused incorrect behavior:** Violated Rule 12: "Usage report... must reflect the current state immediately." If an admin cached the report, they wouldn't see newly created bookings until a cancellation eventually cleared the cache.
+- **How it was fixed:** Added the missing `cache.invalidate_report` call:
+  Before:
+  ```python
+  stats.record_create(room.id, price_cents)
+  cache.invalidate_availability(room.id, start.date().isoformat())
+  ```
+  After:
+  ```python
+  stats.record_create(room.id, price_cents)
+  cache.invalidate_report(user.org_id)
+  cache.invalidate_availability(room.id, start.date().isoformat())
+  ```
+
+---
+
+## Bug 21 — Usage Report Cache Not Invalidated on Room Creation
+- **File:** `app/routers/rooms.py`, line 57
+- **What the bug was:** When an admin creates a new room, the usage report cache was not invalidated.
+- **Why it caused incorrect behavior:** Violated Rule 12: "Usage report... returns, per room in the caller's org (including rooms with zero bookings)... Must reflect the current state immediately." The newly created room (which has zero bookings) would not show up in the cached report.
+- **How it was fixed:** Cleared the report cache right before returning the new room:
+  Before:
+  ```python
+  db.add(room)
+  db.commit()
+  db.refresh(room)
+  return _serialize_room(room)
+  ```
+  After:
+  ```python
+  db.add(room)
+  db.commit()
+  db.refresh(room)
+  cache.invalidate_report(admin.org_id)
+  return _serialize_room(room)
+  ```
+
+---
+
+## Bug 22 — Room Double-Booking Under Concurrency
+- **File:** `app/routers/bookings.py`, line 102
+- **What the bug was:** The `create_booking` endpoint evaluated `_has_conflict` (which queried the DB for overlaps), then called `_pricing_warmup()` which paused for 50ms, and only then inserted the new booking. Under concurrent load, multiple threads would evaluate `_has_conflict` to `False` simultaneously, sleep, and then all insert overlapping bookings for the exact same room and time.
+- **Why it caused incorrect behavior:** Violated Rule 3: "Conflict -> 409 ROOM CONFLICT. Must hold under concurrent requests."
+- **How it was fixed:** Introduced a `_booking_lock = threading.Lock()` and wrapped the conflict evaluation and database insert within the lock to serialize overlapping requests across threads.
+
+---
+
+## Bug 23 — Quota Limit Bypassed Under Concurrency
+- **File:** `app/routers/bookings.py`, line 105
+- **What the bug was:** Similar to Bug 22, the `_check_quota` function read the user's current booking count, then slept for 100ms via `_quota_audit()`. Under concurrent load, a user at 2 bookings who sent 5 concurrent requests would have all 5 threads read the count as 2, pass the check, and insert 5 new bookings — ending up with 7 bookings total in a 24-hour window.
+- **Why it caused incorrect behavior:** Violated Rule 4: "A member may hold at most 3 confirmed bookings... Must hold under concurrent requests."
+- **How it was fixed:** The `_booking_lock` added in Bug 22 encompasses the `_check_quota` call and the subsequent `db.commit()`, preventing multiple threads from reading the same pre-insertion quota state.
+
+---
+
+## Bug 24 — Duplicate Refund Logs on Concurrent Cancellations
+- **File:** `app/routers/bookings.py`, line 198
+- **What the bug was:** The `cancel_booking` endpoint checked if `booking.status == "cancelled"`, logged the refund, slept via `_settlement_pause()`, and then set the status to "cancelled" and committed. Under concurrent cancellation requests for the exact same booking, both threads would pass the initial status check, and both would insert a new `RefundLog` row.
+- **Why it caused incorrect behavior:** Violated Rule 6: "A cancelled booking has exactly one RefundLog entry... Must hold under concurrent cancel requests for the same booking."
+- **How it was fixed:** Wrapped the status check, refund math, and status update within `_booking_lock`, ensuring that the second thread is blocked until the first completes. Additionally, added `db.refresh(booking)` inside the lock so the second thread sees the updated "cancelled" status and correctly throws the 409 error.
+
