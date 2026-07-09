@@ -405,3 +405,18 @@
 - **Why it caused incorrect behavior:** Violated Rule 6: "A cancelled booking has exactly one RefundLog entry... Must hold under concurrent cancel requests for the same booking."
 - **How it was fixed:** Wrapped the status check, refund math, and status update within `_booking_lock`, ensuring that the second thread is blocked until the first completes. Additionally, added `db.refresh(booking)` inside the lock so the second thread sees the updated "cancelled" status and correctly throws the 409 error.
 
+---
+
+## Bug 25 - Concurrent Registration (IntegrityError 500)
+- **File:** `app/routers/auth.py`, line 24
+- **What the bug was:** The `POST /auth/register` endpoint checked for organization and username existence before creating them. Under concurrent load, multiple identical requests would pass the checks and insert simultaneously, throwing an unhandled SQLite `IntegrityError` (500 crash).
+- **Why it caused incorrect behavior:** Violates Rule 15 and Rule 16. Duplicate usernames must return `409`, not `500`.
+- **How it was fixed:** Wrapped the `register` logic in a `_register_lock = threading.Lock()` to serialize checks and inserts.
+
+---
+
+## Bug 26 - Export Cross-Org Authorization Bypass
+- **File:** `app/routers/admin.py`, line 69
+- **What the bug was:** `GET /admin/export` accepted a `room_id`. If it belonged to a different organization, the API silently excluded it and returned a 200 OK empty CSV.
+- **Why it caused incorrect behavior:** Violates Rule 9: "Cross-org resource IDs behave as non-existent -> 404".
+- **How it was fixed:** Added an explicit `db.query(Room).filter(Room.id == room_id, Room.org_id == admin.org_id).first()` ownership check before generating the export, throwing a 404 if not found.
